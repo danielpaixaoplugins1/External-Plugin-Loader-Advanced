@@ -1,0 +1,153 @@
+<?php
+/**
+ * Plugin Name: External Plugin Loader Advanced
+ * Description: Carrega, lista, ativa e desativa plugins de arquivos ZIP personalizados, armazenando-os em um diretório específico. Acesso restrito a usuários com capacidade de administrador.
+ * Version: 3.0
+ * Author: Daniel Oliveira da Paixão & Guru do WP
+ */
+
+if (!defined('ABSPATH')) exit;
+
+class External_Plugin_Loader_Advanced {
+    private $plugin_dir;
+    private $option_name = 'custom_loaded_plugins';
+
+    public function __construct() {
+        $this->plugin_dir = WP_CONTENT_DIR . '/custom-plugins';
+        add_action('admin_menu', array($this, 'create_admin_menu'));
+        add_action('plugins_loaded', array($this, 'load_external_plugins'));
+    }
+
+    public function create_admin_menu() {
+        if (!current_user_can('manage_options')) return;
+        add_menu_page('External Plugin Loader', 'External Plugin Loader', 'manage_options', 'epl_plugin_loader', array($this, 'render_admin_page'));
+    }
+
+    public function render_admin_page() {
+        $this->handle_actions();
+        echo '<div class="wrap"><h1>External Plugin Loader</h1>';
+        $this->render_upload_form();
+        $this->list_uploaded_plugins();
+        echo '</div>';
+    }
+
+    private function handle_actions() {
+        if (isset($_REQUEST['action'])) {
+            $action = $_REQUEST['action'];
+            $plugin = isset($_REQUEST['plugin']) ? $_REQUEST['plugin'] : '';
+            $nonce = isset($_REQUEST['_wpnonce']) ? $_REQUEST['_wpnonce'] : '';
+
+            if ($action === 'activate' && wp_verify_nonce($nonce, 'activate-plugin_' . $plugin)) {
+                $this->activate_plugin($plugin);
+                echo '<div class="updated notice"><p>Plugin activated successfully.</p></div>';
+            } elseif ($action === 'deactivate' && wp_verify_nonce($nonce, 'deactivate-plugin_' . $plugin)) {
+                $this->deactivate_plugin($plugin);
+                echo '<div class="updated notice"><p>Plugin deactivated successfully.</p></div>';
+            }
+        }
+
+        if (isset($_FILES['epl_plugin_file']['name'])) {
+            $this->handle_upload();
+        }
+    }
+
+    private function handle_upload() {
+        if (!function_exists('wp_handle_upload')) {
+            require_once(ABSPATH . 'wp-admin/includes/file.php');
+        }
+
+        $file = wp_handle_upload($_FILES['epl_plugin_file'], ['test_form' => false]);
+        if (isset($file['file'])) {
+            $this->extract_and_register_plugin($file['file']);
+        } else {
+            echo '<div class="notice notice-error"><p>Error uploading file.</p></div>';
+        }
+    }
+
+    private function extract_and_register_plugin($file_path) {
+        require_once(ABSPATH . 'wp-admin/includes/file.php');
+        WP_Filesystem();
+        $zip = unzip_file($file_path, $this->plugin_dir);
+        if (is_wp_error($zip)) {
+            echo '<div class="notice notice-error"><p>Error extracting plugin: ' . $zip->get_error_message() . '</p></div>';
+            return;
+        }
+        $extracted_path = trailingslashit($this->plugin_dir) . basename($file_path, ".zip");
+        $this->register_plugin($extracted_path);
+    }
+
+    private function register_plugin($plugin_path) {
+        $plugin_data = $this->get_plugin_data($plugin_path);
+        if (!$plugin_data) {
+            echo '<div class="notice notice-error"><p>Failed to get plugin data.</p></div>';
+            return;
+        }
+        $custom_plugins = get_option($this->option_name, []);
+        $custom_plugins[$plugin_data['Name']] = [
+            'plugin_path' => $plugin_path,
+            'Name' => $plugin_data['Name'],
+            'Version' => $plugin_data['Version'],
+            'active' => false
+        ];
+        update_option($this->option_name, $custom_plugins);
+    }
+
+    public function load_external_plugins() {
+        $custom_plugins = get_option($this->option_name, []);
+        foreach ($custom_plugins as $plugin) {
+            if (!empty($plugin['active']) && file_exists($plugin['plugin_path'])) {
+                include_once $plugin['plugin_path'];
+            }
+        }
+    }
+
+    private function activate_plugin($plugin_name) {
+        $custom_plugins = get_option($this->option_name, []);
+        if (isset($custom_plugins[$plugin_name])) {
+            $custom_plugins[$plugin_name]['active'] = true;
+            update_option($this->option_name, $custom_plugins);
+        }
+    }
+
+    private function deactivate_plugin($plugin_name) {
+        $custom_plugins = get_option($this->option_name, []);
+        if (isset($custom_plugins[$plugin_name])) {
+            $custom_plugins[$plugin_name]['active'] = false;
+            update_option($this->option_name, $custom_plugins);
+        }
+    }
+
+    private function list_uploaded_plugins() {
+        $custom_plugins = get_option($this->option_name, []);
+        echo '<h2>Uploaded Plugins</h2><ul>';
+        foreach ($custom_plugins as $plugin_name => $plugin_data) {
+            echo '<li>' . esc_html($plugin_name) . ' - ' . esc_html($plugin_data['Version']);
+            echo $plugin_data['active'] ? ' - <strong>Active</strong>' : ' - <a href="' . wp_nonce_url(admin_url('admin.php?page=epl_plugin_loader&action=activate&plugin=' . urlencode($plugin_name)), 'activate-plugin_' . $plugin_name) . '">Activate</a>';
+            echo $plugin_data['active'] ? ' - <a href="' . wp_nonce_url(admin_url('admin.php?page=epl_plugin_loader&action=deactivate&plugin=' . urlencode($plugin_name)), 'deactivate-plugin_' . $plugin_name) . '">Deactivate</a>' : '';
+            echo '</li>';
+        }
+        echo '</ul>';
+    }
+
+    private function render_upload_form() {
+        echo '<h2>Upload Plugin</h2>';
+        echo '<form method="post" enctype="multipart/form-data">';
+        wp_nonce_field('action', 'epl_upload_plugin_nonce');
+        echo '<input type="file" name="epl_plugin_file" accept=".zip" required>';
+        echo '<input type="submit" value="Upload Plugin" class="button button-primary">';
+        echo '</form>';
+    }
+
+    private function get_plugin_data($plugin_path) {
+        $plugin_files = glob($plugin_path . '/*.php');
+        foreach ($plugin_files as $file) {
+            $data = get_file_data($file, ['Name' => 'Plugin Name', 'Version' => 'Version']);
+            if (!empty($data['Name'])) {
+                return ['Name' => $data['Name'], 'Version' => $data['Version'], 'plugin_path' => $file];
+            }
+        }
+        return false;
+    }
+}
+
+new External_Plugin_Loader_Advanced();
